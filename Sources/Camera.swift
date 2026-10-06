@@ -24,32 +24,93 @@ final class CameraModel: ObservableObject {
     @Published var savedThisSequence: [String] = [] // Photos local identifiers
     @Published var inFlight = 0
     @Published var status = ""
+    /// Why the camera couldn't start. Stays on screen until it's fixed.
+    @Published var setupProblem: String?
+    /// True when the fix is a permission switch in Settings.
+    @Published var needsSettings = false
+    private var runtimeErrorObserver: NSObjectProtocol?
 
     // MARK: Setup
 
+    /// Safe to call repeatedly (e.g. every time the app comes back to the front).
     func start() async {
-        guard !configured else { return }
-        guard await AVCaptureDevice.requestAccess(for: .video) else {
-            status = "Camera access is off. Turn it on in Settings."
+        if configured {
+            if !session.isRunning {
+                let session = self.session
+                sessionQueue.async { session.startRunning() }
+            }
+            await checkPhotosAccess()
             return
         }
-        _ = await AVCaptureDevice.requestAccess(for: .audio)
-        let photos = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-        if photos != .authorized && photos != .limited {
-            status = "Photos access is off, so Live Photos can't be saved."
+
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .notDetermined:
+            guard await AVCaptureDevice.requestAccess(for: .video) else {
+                setProblem("Camera access is off for LiveSequence.", settings: true)
+                return
+            }
+        case .denied, .restricted:
+            setProblem("Camera access is off for LiveSequence.", settings: true)
+            return
+        default:
+            break
         }
+
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+
+        // Start the camera first, so the preview never waits on the Photos prompt.
+        setupProblem = nil
+        needsSettings = false
         configureSession()
+
+        await checkPhotosAccess()
+    }
+
+    /// Photos access is only needed to save, so it's asked for separately
+    /// and never blocks the camera.
+    func checkPhotosAccess() async {
+        var photos = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if photos == .notDetermined {
+            photos = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        }
+        if photos == .authorized || photos == .limited {
+            if needsSettings { setupProblem = nil; needsSettings = false }
+        } else if setupProblem == nil {
+            setProblem("Photos access is off, so Live Photos can't be saved.", settings: true)
+        }
+    }
+
+    private func setProblem(_ text: String, settings: Bool = false) {
+        setupProblem = text
+        needsSettings = settings
     }
 
     private func configureSession() {
         session.beginConfiguration()
+        // Clear anything left from an earlier failed attempt.
+        session.inputs.forEach { session.removeInput($0) }
+        session.outputs.forEach { session.removeOutput($0) }
         session.sessionPreset = .photo
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-                ?? AVCaptureDevice.default(for: .video),
-              let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else {
-            status = "No camera available."
+        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(for: .video)
+        guard let device else {
+            setProblem("No camera found on this device.")
+            session.commitConfiguration()
+            return
+        }
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: device)
+        } catch {
+            setProblem("Couldn't open the camera: \(error.localizedDescription)")
+            session.commitConfiguration()
+            return
+        }
+        guard session.canAddInput(input) else {
+            setProblem("Couldn't connect to the camera.")
             session.commitConfiguration()
             return
         }
@@ -64,28 +125,58 @@ final class CameraModel: ObservableObject {
         }
 
         guard session.canAddOutput(photoOutput) else {
-            status = "Can't set up photo capture."
+            setProblem("Couldn't set up photo capture.")
             session.commitConfiguration()
             return
         }
         session.addOutput(photoOutput)
         photoOutput.maxPhotoQualityPrioritization = .balanced
-
-        if photoOutput.isLivePhotoCaptureSupported {
-            photoOutput.isLivePhotoCaptureEnabled = true
-            // Auto-trimming cuts motion it thinks is unwanted. Off = full clips,
-            // which keeps neighbouring Live Photos overlapping.
-            photoOutput.isLivePhotoAutoTrimmingEnabled = false
-        } else {
-            status = "This camera doesn't support Live Photos."
-        }
+        enableLivePhotosIfSupported()
 
         session.commitConfiguration()
         configured = true
         setupRotation()
 
+        // Report camera failures instead of silently showing a black screen.
+        runtimeErrorObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main
+        ) { [weak self] note in
+            let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+            Task { @MainActor in
+                self?.setProblem("Camera stopped: \(error?.localizedDescription ?? "unknown error")")
+            }
+        }
+
         let session = self.session
-        sessionQueue.async { session.startRunning() }
+        sessionQueue.async {
+            session.startRunning()
+            DispatchQueue.main.async { [weak self] in self?.afterSessionStarted() }
+        }
+    }
+
+    private func enableLivePhotosIfSupported() {
+        guard photoOutput.isLivePhotoCaptureSupported else { return }
+        photoOutput.isLivePhotoCaptureEnabled = true
+        // Auto-trimming cuts motion it thinks is unwanted. Off = full clips,
+        // which keeps neighbouring Live Photos overlapping.
+        photoOutput.isLivePhotoAutoTrimmingEnabled = false
+    }
+
+    /// Some devices only report Live Photo support once the camera is running,
+    /// so check again here before giving up.
+    private func afterSessionStarted() {
+        guard session.isRunning else {
+            setProblem("The camera didn't start. Close the app fully and reopen it.")
+            return
+        }
+        if !photoOutput.isLivePhotoCaptureEnabled {
+            session.beginConfiguration()
+            enableLivePhotosIfSupported()
+            session.commitConfiguration()
+        }
+        if !photoOutput.isLivePhotoCaptureEnabled {
+            setProblem("Live Photos aren't supported by this camera setup.")
+        }
     }
 
     func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
@@ -112,8 +203,10 @@ final class CameraModel: ObservableObject {
     }
 
     func startSequence() {
+        // Keep the real setup problem on screen rather than replacing it.
+        guard setupProblem == nil else { return }
         guard photoOutput.isLivePhotoCaptureEnabled else {
-            status = "Live Photos aren't available on this camera."
+            setProblem("Live Photos aren't ready yet. Try again in a moment.")
             return
         }
         status = ""
