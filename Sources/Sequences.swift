@@ -157,14 +157,39 @@ enum ClipStitcher {
         return url
     }
 
+    /// The moment the still photo was taken, inside a Live Photo's motion clip.
+    /// iOS stores it as a "still-image-time" metadata marker in the clip.
+    static func stillImageTime(in asset: AVURLAsset) async -> CMTime? {
+        guard let tracks = try? await asset.loadTracks(withMediaType: .metadata) else { return nil }
+        for track in tracks {
+            guard let reader = try? AVAssetReader(asset: asset) else { continue }
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            guard reader.canAdd(output) else { continue }
+            reader.add(output)
+            let adaptor = AVAssetReaderOutputMetadataAdaptor(assetReaderTrackOutput: output)
+            guard reader.startReading() else { continue }
+            while let group = adaptor.nextTimedMetadataGroup() {
+                let isStill = group.items.contains {
+                    $0.identifier?.rawValue == "mdta/com.apple.quicktime.still-image-time"
+                }
+                if isStill {
+                    reader.cancelReading()
+                    return group.timeRange.start
+                }
+            }
+        }
+        return nil
+    }
+
     static func stitch(_ clips: [Clip], trimOverlaps: Bool) async throws -> URL {
         struct Loaded {
             let asset: AVURLAsset       // must stay alive while its tracks are used
             let video: AVAssetTrack
             let audio: AVAssetTrack?
             let range: CMTimeRange      // the clip's real video range
-            let date: Date
+            let absoluteStart: Double   // real-world time (seconds) of the clip's first frame
             var duration: Double { range.duration.seconds }
+            var absoluteEnd: Double { absoluteStart + duration }
         }
 
         var loaded: [Loaded] = []
@@ -174,12 +199,22 @@ enum ClipStitcher {
                 guard let video = try await asset.loadTracks(withMediaType: .video).first else { continue }
                 let audio = try await asset.loadTracks(withMediaType: .audio).first
                 let range = try await video.load(.timeRange)
-                guard range.duration.seconds > 0.05 else { continue }
-                loaded.append(Loaded(asset: asset, video: video, audio: audio, range: range, date: clip.date))
+                let duration = range.duration.seconds
+                guard duration > 0.05 else { continue }
+                // Where the photo itself sits inside the clip. Live Photo clips record
+                // this exactly; fall back to the middle only if it's missing.
+                var photoOffset = duration / 2
+                if let still = await stillImageTime(in: asset) {
+                    photoOffset = min(max((still - range.start).seconds, 0), duration)
+                }
+                let start = clip.date.timeIntervalSince1970 - photoOffset
+                loaded.append(Loaded(asset: asset, video: video, audio: audio,
+                                     range: range, absoluteStart: start))
             } catch {
                 continue // skip a clip that can't be read
             }
         }
+        loaded.sort { $0.absoluteStart < $1.absoluteStart }
         guard let first = loaded.first else { throw BuildError.noVideo }
 
         let composition = AVMutableComposition()
@@ -191,22 +226,22 @@ enum ClipStitcher {
         videoOut.preferredTransform = try await first.video.load(.preferredTransform)
 
         var cursor = CMTime.zero
+        var shownUntil: Double? = nil   // real-world time already covered by earlier clips
         for (i, clip) in loaded.enumerated() {
-            var length = clip.duration
-            // Each clip runs roughly half before and half after its shutter moment.
-            // If the next clip starts before this one ends, cut this one there so
-            // the same moment isn't shown twice.
-            if trimOverlaps, i + 1 < loaded.count {
-                let next = loaded[i + 1]
-                let thisStart = clip.date.timeIntervalSince1970 - clip.duration / 2
-                let nextStart = next.date.timeIntervalSince1970 - next.duration / 2
-                let gap = nextStart - thisStart
-                if gap > 0.2 { length = min(length, gap) }
+            // Start each clip where the previous one ended on the real-world clock,
+            // so overlapping moments are shown once and nothing replays.
+            var skip = 0.0
+            if trimOverlaps, let shownUntil {
+                skip = max(0, shownUntil - clip.absoluteStart)
             }
+            guard skip < clip.duration - 0.05 else { continue } // fully covered already
+            let timescale: CMTimeScale = 600
+            let startTime = clip.range.start + CMTime(seconds: skip, preferredTimescale: timescale)
             // Never ask for more than the clip actually has (rounding can overshoot).
-            let wanted = CMTime(seconds: length, preferredTimescale: clip.range.duration.timescale)
-            let range = CMTimeRange(start: clip.range.start,
-                                    duration: CMTimeMinimum(wanted, clip.range.duration))
+            let range = CMTimeRange(start: startTime,
+                                    duration: CMTimeMaximum(.zero, clip.range.end - startTime))
+            guard range.duration.seconds > 0.03 else { continue }
+            shownUntil = max(shownUntil ?? -.infinity, clip.absoluteEnd)
             do {
                 try videoOut.insertTimeRange(range, of: clip.video, at: cursor)
             } catch {
