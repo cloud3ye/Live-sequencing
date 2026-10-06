@@ -218,12 +218,26 @@ enum ClipStitcher {
         guard let first = loaded.first else { throw BuildError.noVideo }
 
         let composition = AVMutableComposition()
-        guard let videoOut = composition.addMutableTrack(withMediaType: .video,
-                                                         preferredTrackID: kCMPersistentTrackID_Invalid)
+        // Two video tracks, used alternately, so each clip can overlap the
+        // previous one briefly and dissolve into it.
+        guard let trackA = composition.addMutableTrack(withMediaType: .video,
+                                                       preferredTrackID: kCMPersistentTrackID_Invalid),
+              let trackB = composition.addMutableTrack(withMediaType: .video,
+                                                       preferredTrackID: kCMPersistentTrackID_Invalid)
         else { throw BuildError.noVideo }
+        let videoTracks = [trackA, trackB]
         let audioOut = composition.addMutableTrack(withMediaType: .audio,
                                                    preferredTrackID: kCMPersistentTrackID_Invalid)
-        videoOut.preferredTransform = try await first.video.load(.preferredTransform)
+
+        struct Placed {
+            let track: AVMutableCompositionTrack
+            let transform: CGAffineTransform
+            let timeRange: CMTimeRange   // where it sits in the final video
+            let fadeIn: CMTime           // how much of its start overlaps the previous clip
+        }
+        let fadeLength = 0.1             // seconds: about 3 frames
+        let timescale: CMTimeScale = 600
+        var placed: [Placed] = []
 
         var cursor = CMTime.zero
         var shownUntil: Double? = nil   // real-world time already covered by earlier clips
@@ -235,45 +249,99 @@ enum ClipStitcher {
                 skip = max(0, shownUntil - clip.absoluteStart)
             }
             guard skip < clip.duration - 0.05 else { continue } // fully covered already
-            let timescale: CMTimeScale = 600
             let startTime = clip.range.start + CMTime(seconds: skip, preferredTimescale: timescale)
-            // Never ask for more than the clip actually has (rounding can overshoot).
-            let range = CMTimeRange(start: startTime,
-                                    duration: CMTimeMaximum(.zero, clip.range.end - startTime))
-            guard range.duration.seconds > 0.03 else { continue }
+            guard clip.range.end > startTime else { continue }
+            let own = CMTimeRange(start: startTime, end: clip.range.end)
+            guard own.duration.seconds > 0.03 else { continue }
             shownUntil = max(shownUntil ?? -.infinity, clip.absoluteEnd)
+
+            // Borrow a few frames from just before the cut so this clip can
+            // dissolve in over the end of the previous one.
+            var fadeIn = CMTime.zero
+            if let prev = placed.last {
+                let available = (startTime - clip.range.start).seconds
+                let prevSolo = (prev.timeRange.duration - prev.fadeIn).seconds
+                let f = min(fadeLength, available, prevSolo / 2, own.duration.seconds / 2)
+                if f > 0.02 { fadeIn = CMTime(seconds: f, preferredTimescale: timescale) }
+            }
+            let source = CMTimeRange(start: startTime - fadeIn, end: clip.range.end)
+            let insertAt = cursor - fadeIn
+            let track = videoTracks[placed.count % 2]
             do {
-                try videoOut.insertTimeRange(range, of: clip.video, at: cursor)
+                try track.insertTimeRange(source, of: clip.video, at: insertAt)
             } catch {
                 throw BuildError.step("Joining clip \(i + 1)", error)
             }
+            let transform = (try? await clip.video.load(.preferredTransform)) ?? .identity
+            placed.append(Placed(track: track, transform: transform,
+                                 timeRange: CMTimeRange(start: insertAt, duration: source.duration),
+                                 fadeIn: fadeIn))
+
+            // Sound follows the cuts directly (no overlap), so it never doubles up.
             if let audio = clip.audio, let audioOut {
-                // Clip the audio to what the audio track really contains.
                 if let audioRange = try? await audio.load(.timeRange) {
-                    let usable = CMTimeRangeGetIntersection(range, otherRange: audioRange)
+                    let usable = CMTimeRangeGetIntersection(own, otherRange: audioRange)
                     if usable.duration > .zero {
                         try? audioOut.insertTimeRange(usable, of: audio,
-                                                      at: cursor + (usable.start - range.start))
+                                                      at: cursor + (usable.start - own.start))
                     }
                 }
             }
-            cursor = cursor + range.duration
+            cursor = insertAt + source.duration
+        }
+        guard !placed.isEmpty else { throw BuildError.noVideo }
+
+        // Empty tracks make the export fail, so drop any that got nothing.
+        if let audioOut, audioOut.segments.isEmpty { composition.removeTrack(audioOut) }
+        if trackB.segments.isEmpty { composition.removeTrack(trackB) }
+
+        // Describe what's on screen at every moment: one clip on its own, or
+        // two clips during a dissolve (the outgoing one fading out on top).
+        var instructions: [AVMutableVideoCompositionInstruction] = []
+        for (i, p) in placed.enumerated() {
+            let soloStart = p.timeRange.start + p.fadeIn
+            let nextFade = i + 1 < placed.count ? placed[i + 1].fadeIn : .zero
+            let soloEnd = p.timeRange.end - nextFade
+            if soloEnd > soloStart {
+                let instruction = AVMutableVideoCompositionInstruction()
+                instruction.timeRange = CMTimeRange(start: soloStart, end: soloEnd)
+                let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: p.track)
+                layer.setTransform(p.transform, at: soloStart)
+                instruction.layerInstructions = [layer]
+                instructions.append(instruction)
+            }
+            if i + 1 < placed.count, nextFade > .zero {
+                let next = placed[i + 1]
+                let dissolve = CMTimeRange(start: soloEnd, duration: nextFade)
+                let instruction = AVMutableVideoCompositionInstruction()
+                instruction.timeRange = dissolve
+                let outgoing = AVMutableVideoCompositionLayerInstruction(assetTrack: p.track)
+                outgoing.setTransform(p.transform, at: dissolve.start)
+                outgoing.setOpacityRamp(fromStartOpacity: 1, toEndOpacity: 0, timeRange: dissolve)
+                let incoming = AVMutableVideoCompositionLayerInstruction(assetTrack: next.track)
+                incoming.setTransform(next.transform, at: dissolve.start)
+                instruction.layerInstructions = [outgoing, incoming]
+                instructions.append(instruction)
+            }
         }
 
-        // An empty audio track makes the export fail, so drop it if nothing went in.
-        if let audioOut, audioOut.segments.isEmpty {
-            composition.removeTrack(audioOut)
-        }
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.instructions = instructions
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        let naturalSize = (try? await first.video.load(.naturalSize)) ?? CGSize(width: 1920, height: 1080)
+        let rotated = CGRect(origin: .zero, size: naturalSize).applying(placed[0].transform)
+        videoComposition.renderSize = CGSize(width: abs(rotated.width), height: abs(rotated.height))
 
-        // Try best quality first, then a straight copy if that preset won't work.
+        // Try best quality first, then a fixed-size export if that preset won't work.
         var lastError: Error = BuildError.exportFailed
-        for preset in [AVAssetExportPresetHighestQuality, AVAssetExportPresetPassthrough] {
+        for preset in [AVAssetExportPresetHighestQuality, AVAssetExportPreset1920x1080] {
             let outputURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("LiveSequence-\(UUID().uuidString)")
                 .appendingPathExtension("mov")
             guard let export = AVAssetExportSession(asset: composition, presetName: preset) else { continue }
             export.outputURL = outputURL
             export.outputFileType = .mov
+            export.videoComposition = videoComposition
             await export.export()
             if export.status == .completed { return outputURL }
             lastError = export.error ?? BuildError.exportFailed
