@@ -36,8 +36,8 @@ final class CameraModel: ObservableObject {
     func start() async {
         if configured {
             if !session.isRunning {
-                let session = self.session
-                sessionQueue.async { session.startRunning() }
+                let runningSession = self.session
+                sessionQueue.async { runningSession.startRunning() }
             }
             await checkPhotosAccess()
             return
@@ -147,9 +147,9 @@ final class CameraModel: ObservableObject {
             }
         }
 
-        let session = self.session
+        let runningSession = self.session
         sessionQueue.async {
-            session.startRunning()
+            runningSession.startRunning()
             DispatchQueue.main.async { [weak self] in self?.afterSessionStarted() }
         }
     }
