@@ -7,7 +7,7 @@ struct LiveSequence: Identifiable {
     var start: Date { assets.first?.creationDate ?? .distantPast }
 }
 
-/// Finds runs of Live Photos in the library taken within `maxGap` seconds of each other.
+/// Finds runs of Live Photos in the library taken within maxGap seconds of each other.
 @MainActor
 final class SequenceLibrary: ObservableObject {
     @Published var sequences: [LiveSequence] = []
@@ -77,23 +77,32 @@ final class VideoBuilder: ObservableObject {
                 ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast)
             }
             var clips: [ClipStitcher.Clip] = []
+            var skipped = 0
             for asset in sorted {
-                if let url = try await ClipStitcher.pairedVideo(for: asset) {
+                // One unreadable clip shouldn't sink the whole video.
+                if let url = try? await ClipStitcher.pairedVideo(for: asset) {
                     clips.append(.init(url: url, date: asset.creationDate ?? .distantPast))
+                } else {
+                    skipped += 1
                 }
             }
             guard clips.count > 1 else {
-                message = "Need at least two Live Photos with motion."
+                message = "Need at least two Live Photos with motion (found \(clips.count), \(skipped) unreadable)."
                 return
             }
 
             let output = try await ClipStitcher.stitch(clips, trimOverlaps: trimOverlaps)
-            try await PHPhotoLibrary.shared().performChanges {
-                _ = PHAssetCreationRequest.creationRequestForAssetFromVideo(atFileURL: output)
+            do {
+                try await PHPhotoLibrary.shared().performChanges {
+                    _ = PHAssetCreationRequest.creationRequestForAssetFromVideo(atFileURL: output)
+                }
+            } catch {
+                throw ClipStitcher.BuildError.step("Saving to Photos", error)
             }
             message = "Saved a video from \(clips.count) Live Photos to Photos."
+                + (skipped > 0 ? " (\(skipped) skipped)" : "")
         } catch {
-            message = "Couldn't build the video: \(error.localizedDescription)"
+            message = "Couldn't build the video. \(ClipStitcher.describe(error))"
         }
     }
 }
@@ -106,12 +115,25 @@ enum ClipStitcher {
 
     enum BuildError: LocalizedError {
         case noVideo, exportFailed
+        case step(String, Error)
         var errorDescription: String? {
             switch self {
             case .noVideo: return "No motion clips could be read."
             case .exportFailed: return "Export didn't finish."
+            case .step(let name, let error): return "\(name) failed: \(ClipStitcher.describe(error))"
             }
         }
+    }
+
+    /// Error text with its domain and code, so a vague iOS message can be traced.
+    static func describe(_ error: Error) -> String {
+        if let build = error as? BuildError { return build.errorDescription ?? "Unknown error" }
+        let ns = error as NSError
+        var text = "\(ns.localizedDescription) [\(ns.domain) \(ns.code)]"
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            text += " ← [\(underlying.domain) \(underlying.code)]"
+        }
+        return text
     }
 
     /// Copies a Live Photo's motion clip out of the library to a temp file.
@@ -139,19 +161,23 @@ enum ClipStitcher {
         struct Loaded {
             let video: AVAssetTrack
             let audio: AVAssetTrack?
-            let start: CMTime
-            let duration: Double
+            let range: CMTimeRange      // the clip's real video range
             let date: Date
+            var duration: Double { range.duration.seconds }
         }
 
         var loaded: [Loaded] = []
         for clip in clips {
-            let asset = AVURLAsset(url: clip.url)
-            guard let video = try await asset.loadTracks(withMediaType: .video).first else { continue }
-            let audio = try await asset.loadTracks(withMediaType: .audio).first
-            let range = try await video.load(.timeRange)
-            loaded.append(Loaded(video: video, audio: audio, start: range.start,
-                                 duration: range.duration.seconds, date: clip.date))
+            do {
+                let asset = AVURLAsset(url: clip.url)
+                guard let video = try await asset.loadTracks(withMediaType: .video).first else { continue }
+                let audio = try await asset.loadTracks(withMediaType: .audio).first
+                let range = try await video.load(.timeRange)
+                guard range.duration.seconds > 0.05 else { continue }
+                loaded.append(Loaded(video: video, audio: audio, range: range, date: clip.date))
+            } catch {
+                continue // skip a clip that can't be read
+            }
         }
         guard let first = loaded.first else { throw BuildError.noVideo }
 
@@ -176,26 +202,46 @@ enum ClipStitcher {
                 let gap = nextStart - thisStart
                 if gap > 0.2 { length = min(length, gap) }
             }
-            let range = CMTimeRange(start: clip.start,
-                                    duration: CMTime(seconds: length, preferredTimescale: 600))
-            try videoOut.insertTimeRange(range, of: clip.video, at: cursor)
-            if let audio = clip.audio {
-                try? audioOut?.insertTimeRange(range, of: audio, at: cursor)
+            // Never ask for more than the clip actually has (rounding can overshoot).
+            let wanted = CMTime(seconds: length, preferredTimescale: clip.range.duration.timescale)
+            let range = CMTimeRange(start: clip.range.start,
+                                    duration: CMTimeMinimum(wanted, clip.range.duration))
+            do {
+                try videoOut.insertTimeRange(range, of: clip.video, at: cursor)
+            } catch {
+                throw BuildError.step("Joining clip \(i + 1)", error)
+            }
+            if let audio = clip.audio, let audioOut {
+                // Clip the audio to what the audio track really contains.
+                if let audioRange = try? await audio.load(.timeRange) {
+                    let usable = CMTimeRangeGetIntersection(range, otherRange: audioRange)
+                    if usable.duration > .zero {
+                        try? audioOut.insertTimeRange(usable, of: audio,
+                                                      at: cursor + (usable.start - range.start))
+                    }
+                }
             }
             cursor = cursor + range.duration
         }
 
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("LiveSequence-\(UUID().uuidString)")
-            .appendingPathExtension("mov")
-        guard let export = AVAssetExportSession(asset: composition,
-                                                presetName: AVAssetExportPresetHighestQuality)
-        else { throw BuildError.exportFailed }
-        export.outputURL = outputURL
-        export.outputFileType = .mov
-        await export.export()
-        if let error = export.error { throw error }
-        guard export.status == .completed else { throw BuildError.exportFailed }
-        return outputURL
+        // An empty audio track makes the export fail, so drop it if nothing went in.
+        if let audioOut, audioOut.segments.isEmpty {
+            composition.removeTrack(audioOut)
+        }
+
+        // Try best quality first, then a straight copy if that preset won't work.
+        var lastError: Error = BuildError.exportFailed
+        for preset in [AVAssetExportPresetHighestQuality, AVAssetExportPresetPassthrough] {
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("LiveSequence-\(UUID().uuidString)")
+                .appendingPathExtension("mov")
+            guard let export = AVAssetExportSession(asset: composition, presetName: preset) else { continue }
+            export.outputURL = outputURL
+            export.outputFileType = .mov
+            await export.export()
+            if export.status == .completed { return outputURL }
+            lastError = export.error ?? BuildError.exportFailed
+        }
+        throw BuildError.step("Exporting the video", lastError)
     }
 }
