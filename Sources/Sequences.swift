@@ -181,6 +181,100 @@ enum ClipStitcher {
         return nil
     }
 
+    /// Small greyscale "fingerprints" of each frame in part of a clip, for comparing pictures.
+    static func fingerprints(asset: AVAsset, track: AVAssetTrack,
+                             timeRange: CMTimeRange) -> [(time: CMTime, pixels: [Float])] {
+        guard let reader = try? AVAssetReader(asset: asset) else { return [] }
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        output.alwaysCopiesSampleData = false
+        reader.timeRange = timeRange
+        guard reader.canAdd(output) else { return [] }
+        reader.add(output)
+        guard reader.startReading() else { return [] }
+        var result: [(time: CMTime, pixels: [Float])] = []
+        while let sample = output.copyNextSampleBuffer() {
+            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+            let pixels = grid(of: buffer)
+            if !pixels.isEmpty {
+                result.append((CMSampleBufferGetPresentationTimeStamp(sample), pixels))
+            }
+        }
+        return result
+    }
+
+    /// Average brightness over a 24 x 24 grid of small patches.
+    static func grid(of buffer: CVPixelBuffer, size: Int = 24) -> [Float] {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return [] }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        var out: [Float] = []
+        out.reserveCapacity(size * size)
+        for gy in 0..<size {
+            for gx in 0..<size {
+                let cx = (gx * 2 + 1) * width / (size * 2)
+                let cy = (gy * 2 + 1) * height / (size * 2)
+                var sum = 0
+                for dy in 0..<4 {
+                    for dx in 0..<4 {
+                        let x = min(width - 1, cx + dx * 2)
+                        let y = min(height - 1, cy + dy * 2)
+                        let offset = y * rowBytes + x * 4
+                        sum += Int(bytes[offset]) + Int(bytes[offset + 1]) + Int(bytes[offset + 2])
+                    }
+                }
+                out.append(Float(sum) / 48)
+            }
+        }
+        return out
+    }
+
+    static func difference(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return .infinity }
+        var total: Float = 0
+        for k in 0..<a.count { total += abs(a[k] - b[k]) }
+        return total / Float(a.count)
+    }
+
+    /// How far into the next clip to start (seconds) so it picks up right after the
+    /// previous clip's last frame. Nil when no clearly matching picture is found.
+    static func matchedStart(previousAsset: AVAsset, previousTrack: AVAssetTrack, previousRange: CMTimeRange,
+                             nextAsset: AVAsset, nextTrack: AVAssetTrack, nextRange: CMTimeRange,
+                             guess: Double) -> Double? {
+        let tail = CMTimeRange(start: CMTimeMaximum(previousRange.start,
+                                                    previousRange.end - CMTime(seconds: 0.3, preferredTimescale: 600)),
+                               end: previousRange.end)
+        guard let reference = fingerprints(asset: previousAsset, track: previousTrack, timeRange: tail).last?.pixels
+        else { return nil }
+
+        let duration = nextRange.duration.seconds
+        let low = max(0, guess - 0.8)
+        let high = min(duration, guess + 0.8)
+        guard high > low else { return nil }
+        let window = CMTimeRange(start: nextRange.start + CMTime(seconds: low, preferredTimescale: 600),
+                                 end: nextRange.start + CMTime(seconds: high, preferredTimescale: 600))
+        let frames = fingerprints(asset: nextAsset, track: nextTrack, timeRange: window)
+        guard frames.count >= 3 else { return nil }
+
+        let diffs = frames.map { difference($0.pixels, reference) }
+        guard let best = diffs.indices.min(by: { diffs[$0] < diffs[$1] }) else { return nil }
+        let sortedDiffs = diffs.sorted()
+        let median = sortedDiffs[sortedDiffs.count / 2]
+        // Only trust a match that clearly stands out (or is near-identical).
+        guard diffs[best] < 4 || diffs[best] < median * 0.5 else { return nil }
+
+        // Start on the frame after the match, so the matched moment isn't shown twice.
+        let startTime = best + 1 < frames.count
+            ? frames[best + 1].time
+            : frames[best].time + CMTime(value: 1, timescale: 60)
+        return max(0, (startTime - nextRange.start).seconds)
+    }
+
     static func stitch(_ clips: [Clip], trimOverlaps: Bool) async throws -> URL {
         struct Loaded {
             let asset: AVURLAsset       // must stay alive while its tracks are used
@@ -241,12 +335,23 @@ enum ClipStitcher {
 
         var cursor = CMTime.zero
         var shownUntil: Double? = nil   // real-world time already covered by earlier clips
+        var previous: Loaded? = nil     // the last clip actually used
         for (i, clip) in loaded.enumerated() {
             // Start each clip where the previous one ended on the real-world clock,
             // so overlapping moments are shown once and nothing replays.
             var skip = 0.0
             if trimOverlaps, let shownUntil {
                 skip = max(0, shownUntil - clip.absoluteStart)
+            }
+            // Timestamps are only accurate to a few tenths of a second, so refine the
+            // cut by finding the picture in this clip that matches the previous clip's
+            // last frame, and start just after it.
+            if trimOverlaps, let previous,
+               let matched = matchedStart(previousAsset: previous.asset, previousTrack: previous.video,
+                                          previousRange: previous.range,
+                                          nextAsset: clip.asset, nextTrack: clip.video,
+                                          nextRange: clip.range, guess: skip) {
+                skip = matched
             }
             guard skip < clip.duration - 0.05 else { continue } // fully covered already
             let startTime = clip.range.start + CMTime(seconds: skip, preferredTimescale: timescale)
@@ -273,6 +378,7 @@ enum ClipStitcher {
                 throw BuildError.step("Joining clip \(i + 1)", error)
             }
             let transform = (try? await clip.video.load(.preferredTransform)) ?? .identity
+            previous = clip
             placed.append(Placed(track: track, transform: transform,
                                  timeRange: CMTimeRange(start: insertAt, duration: source.duration),
                                  fadeIn: fadeIn))
