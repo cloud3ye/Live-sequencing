@@ -28,6 +28,23 @@ struct CaptureView: View {
                 if camera.isRunningSequence {
                     pill("Capturing · \(camera.savedThisSequence.count) saved")
                 }
+                if let problem = camera.setupProblem {
+                    VStack(spacing: 8) {
+                        Text(problem)
+                            .font(.callout)
+                            .multilineTextAlignment(.center)
+                        if camera.needsSettings {
+                            Button("Open Settings") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(url)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    .padding(12)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
                 if !camera.status.isEmpty { pill(camera.status) }
                 if builder.isBuilding { pill("Building video…") }
                 if let message = builder.message { pill(message) }
@@ -75,6 +92,10 @@ struct CaptureView: View {
             .padding()
         }
         .task { await camera.start() }
+        // Coming back from Settings (or the background) retries the camera.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            Task { await camera.start() }
+        }
         .onDisappear { camera.stopSequence() }
     }
 
