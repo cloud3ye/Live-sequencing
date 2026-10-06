@@ -19,7 +19,7 @@ final class CameraModel: ObservableObject {
 
     @Published var isRunningSequence = false
     /// Each gap between shutter presses is picked at random from this range.
-    let gapRange: ClosedRange<Double> = 0.8...3.0
+    let gapRange: ClosedRange<Double> = 0.8...2.2
     @Published var lastGap: Double?
     @Published var savedThisSequence: [String] = [] // Photos local identifiers
     @Published var inFlight = 0
