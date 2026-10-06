@@ -159,6 +159,7 @@ enum ClipStitcher {
 
     static func stitch(_ clips: [Clip], trimOverlaps: Bool) async throws -> URL {
         struct Loaded {
+            let asset: AVURLAsset       // must stay alive while its tracks are used
             let video: AVAssetTrack
             let audio: AVAssetTrack?
             let range: CMTimeRange      // the clip's real video range
@@ -174,7 +175,7 @@ enum ClipStitcher {
                 let audio = try await asset.loadTracks(withMediaType: .audio).first
                 let range = try await video.load(.timeRange)
                 guard range.duration.seconds > 0.05 else { continue }
-                loaded.append(Loaded(video: video, audio: audio, range: range, date: clip.date))
+                loaded.append(Loaded(asset: asset, video: video, audio: audio, range: range, date: clip.date))
             } catch {
                 continue // skip a clip that can't be read
             }
