@@ -275,6 +275,19 @@ enum ClipStitcher {
         return max(0, (startTime - nextRange.start).seconds)
     }
 
+    /// Turns a clip upright, then scales and centres it to exactly fill the output frame.
+    static func fit(_ transform: CGAffineTransform, naturalSize: CGSize,
+                    into renderSize: CGSize) -> CGAffineTransform {
+        let box = CGRect(origin: .zero, size: naturalSize).applying(transform)
+        guard box.width > 0, box.height > 0 else { return transform }
+        let scale = max(renderSize.width / box.width, renderSize.height / box.height)
+        return transform
+            .concatenating(CGAffineTransform(translationX: -box.minX, y: -box.minY))
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(translationX: (renderSize.width - box.width * scale) / 2,
+                                             y: (renderSize.height - box.height * scale) / 2))
+    }
+
     static func stitch(_ clips: [Clip], trimOverlaps: Bool) async throws -> URL {
         struct Loaded {
             let asset: AVURLAsset       // must stay alive while its tracks are used
@@ -309,7 +322,7 @@ enum ClipStitcher {
             }
         }
         loaded.sort { $0.absoluteStart < $1.absoluteStart }
-        guard let first = loaded.first else { throw BuildError.noVideo }
+        guard !loaded.isEmpty else { throw BuildError.noVideo }
 
         let composition = AVMutableComposition()
         // Two video tracks, used alternately, so each clip can overlap the
@@ -326,6 +339,7 @@ enum ClipStitcher {
         struct Placed {
             let track: AVMutableCompositionTrack
             let transform: CGAffineTransform
+            let naturalSize: CGSize
             let timeRange: CMTimeRange   // where it sits in the final video
             let fadeIn: CMTime           // how much of its start overlaps the previous clip
         }
@@ -378,8 +392,9 @@ enum ClipStitcher {
                 throw BuildError.step("Joining clip \(i + 1)", error)
             }
             let transform = (try? await clip.video.load(.preferredTransform)) ?? .identity
+            let naturalSize = (try? await clip.video.load(.naturalSize)) ?? .zero
             previous = clip
-            placed.append(Placed(track: track, transform: transform,
+            placed.append(Placed(track: track, transform: transform, naturalSize: naturalSize,
                                  timeRange: CMTimeRange(start: insertAt, duration: source.duration),
                                  fadeIn: fadeIn))
 
@@ -401,6 +416,14 @@ enum ClipStitcher {
         if let audioOut, audioOut.segments.isEmpty { composition.removeTrack(audioOut) }
         if trackB.segments.isEmpty { composition.removeTrack(trackB) }
 
+        // The output frame: the first clip's size, turned upright.
+        let upright = CGRect(origin: .zero, size: placed[0].naturalSize).applying(placed[0].transform)
+        let renderSize = CGSize(width: (abs(upright.width) / 2).rounded() * 2,
+                                height: (abs(upright.height) / 2).rounded() * 2)
+        // Each clip's own rotation data can leave it offset, so place every clip
+        // explicitly: turned upright, scaled to fill the frame, and centred.
+        let fittedTransforms = placed.map { fit($0.transform, naturalSize: $0.naturalSize, into: renderSize) }
+
         // Describe what's on screen at every moment: one clip on its own, or
         // two clips during a dissolve (the outgoing one fading out on top).
         var instructions: [AVMutableVideoCompositionInstruction] = []
@@ -412,7 +435,7 @@ enum ClipStitcher {
                 let instruction = AVMutableVideoCompositionInstruction()
                 instruction.timeRange = CMTimeRange(start: soloStart, end: soloEnd)
                 let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: p.track)
-                layer.setTransform(p.transform, at: soloStart)
+                layer.setTransform(fittedTransforms[i], at: soloStart)
                 instruction.layerInstructions = [layer]
                 instructions.append(instruction)
             }
@@ -422,10 +445,10 @@ enum ClipStitcher {
                 let instruction = AVMutableVideoCompositionInstruction()
                 instruction.timeRange = dissolve
                 let outgoing = AVMutableVideoCompositionLayerInstruction(assetTrack: p.track)
-                outgoing.setTransform(p.transform, at: dissolve.start)
+                outgoing.setTransform(fittedTransforms[i], at: dissolve.start)
                 outgoing.setOpacityRamp(fromStartOpacity: 1, toEndOpacity: 0, timeRange: dissolve)
                 let incoming = AVMutableVideoCompositionLayerInstruction(assetTrack: next.track)
-                incoming.setTransform(next.transform, at: dissolve.start)
+                incoming.setTransform(fittedTransforms[i + 1], at: dissolve.start)
                 instruction.layerInstructions = [outgoing, incoming]
                 instructions.append(instruction)
             }
@@ -436,9 +459,7 @@ enum ClipStitcher {
         // A fine 60 fps grid, so each original frame lands almost exactly when it was
         // recorded and the Live Photos keep their natural, uneven pacing.
         videoComposition.frameDuration = CMTime(value: 1, timescale: 60)
-        let naturalSize = (try? await first.video.load(.naturalSize)) ?? CGSize(width: 1920, height: 1080)
-        let rotated = CGRect(origin: .zero, size: naturalSize).applying(placed[0].transform)
-        videoComposition.renderSize = CGSize(width: abs(rotated.width), height: abs(rotated.height))
+        videoComposition.renderSize = renderSize
 
         // Try best quality first, then a fixed-size export if that preset won't work.
         var lastError: Error = BuildError.exportFailed
