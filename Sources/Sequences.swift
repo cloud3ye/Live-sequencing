@@ -327,7 +327,9 @@ enum ClipStitcher {
 
         let videoComposition = AVMutableVideoComposition()
         videoComposition.instructions = instructions
-        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        // A fine 60 fps grid, so each original frame lands almost exactly when it was
+        // recorded and the Live Photos keep their natural, uneven pacing.
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 60)
         let naturalSize = (try? await first.video.load(.naturalSize)) ?? CGSize(width: 1920, height: 1080)
         let rotated = CGRect(origin: .zero, size: naturalSize).applying(placed[0].transform)
         videoComposition.renderSize = CGSize(width: abs(rotated.width), height: abs(rotated.height))
