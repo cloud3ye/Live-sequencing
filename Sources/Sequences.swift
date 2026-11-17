@@ -1,5 +1,6 @@
 import AVFoundation
 import Photos
+import UIKit
 
 struct LiveSequence: Identifiable {
     let id = UUID()
@@ -60,14 +61,15 @@ final class VideoBuilder: ObservableObject {
     @Published var message: String?
     @Published var trimOverlaps = true
 
-    func build(localIdentifiers: [String]) async {
+    func build(localIdentifiers: [String], gallery: Bool = false) async {
         let result = PHAsset.fetchAssets(withLocalIdentifiers: localIdentifiers, options: nil)
         var assets: [PHAsset] = []
         for i in 0..<result.count { assets.append(result.object(at: i)) }
-        await build(from: assets)
+        await build(from: assets, gallery: gallery)
     }
 
-    func build(from assets: [PHAsset]) async {
+    /// gallery: frame the video like the Photos app, with the sliding thumbnail strip.
+    func build(from assets: [PHAsset], gallery: Bool = false) async {
         isBuilding = true
         message = nil
         defer { isBuilding = false }
@@ -81,7 +83,9 @@ final class VideoBuilder: ObservableObject {
             for asset in sorted {
                 // One unreadable clip shouldn't sink the whole video.
                 if let url = try? await ClipStitcher.pairedVideo(for: asset) {
-                    clips.append(.init(url: url, date: asset.creationDate ?? .distantPast))
+                    let thumbnail = gallery ? await ClipStitcher.thumbnail(for: asset) : nil
+                    clips.append(.init(url: url, date: asset.creationDate ?? .distantPast,
+                                       thumbnail: thumbnail))
                 } else {
                     skipped += 1
                 }
@@ -91,7 +95,7 @@ final class VideoBuilder: ObservableObject {
                 return
             }
 
-            let output = try await ClipStitcher.stitch(clips, trimOverlaps: trimOverlaps)
+            let output = try await ClipStitcher.stitch(clips, trimOverlaps: trimOverlaps, gallery: gallery)
             do {
                 try await PHPhotoLibrary.shared().performChanges {
                     _ = PHAssetCreationRequest.creationRequestForAssetFromVideo(atFileURL: output)
@@ -99,7 +103,7 @@ final class VideoBuilder: ObservableObject {
             } catch {
                 throw ClipStitcher.BuildError.step("Saving to Photos", error)
             }
-            message = "Saved a video from \(clips.count) Live Photos to Photos."
+            message = "Saved a \(gallery ? "gallery " : "")video from \(clips.count) Live Photos to Photos."
                 + (skipped > 0 ? " (\(skipped) skipped)" : "")
         } catch {
             message = "Couldn't build the video. \(ClipStitcher.describe(error))"
@@ -111,6 +115,7 @@ enum ClipStitcher {
     struct Clip {
         let url: URL
         let date: Date
+        var thumbnail: CGImage? = nil   // the still photo, for gallery mode
     }
 
     enum BuildError: LocalizedError {
@@ -278,23 +283,158 @@ enum ClipStitcher {
     /// Turns a clip upright, then scales and centres it to exactly fill the output frame.
     static func fit(_ transform: CGAffineTransform, naturalSize: CGSize,
                     into renderSize: CGSize) -> CGAffineTransform {
+        fit(transform, naturalSize: naturalSize, into: CGRect(origin: .zero, size: renderSize), fill: true)
+    }
+
+    /// Turns a clip upright, then scales it to fill (or fit inside) a rectangle, centred on it.
+    static func fit(_ transform: CGAffineTransform, naturalSize: CGSize,
+                    into rect: CGRect, fill: Bool) -> CGAffineTransform {
         let box = CGRect(origin: .zero, size: naturalSize).applying(transform)
         guard box.width > 0, box.height > 0 else { return transform }
-        let scale = max(renderSize.width / box.width, renderSize.height / box.height)
+        let sx = rect.width / box.width, sy = rect.height / box.height
+        let scale = fill ? max(sx, sy) : min(sx, sy)
         return transform
             .concatenating(CGAffineTransform(translationX: -box.minX, y: -box.minY))
             .concatenating(CGAffineTransform(scaleX: scale, y: scale))
-            .concatenating(CGAffineTransform(translationX: (renderSize.width - box.width * scale) / 2,
-                                             y: (renderSize.height - box.height * scale) / 2))
+            .concatenating(CGAffineTransform(translationX: rect.minX + (rect.width - box.width * scale) / 2,
+                                             y: rect.minY + (rect.height - box.height * scale) / 2))
     }
 
-    static func stitch(_ clips: [Clip], trimOverlaps: Bool) async throws -> URL {
+    // MARK: Gallery mode
+
+    /// The Photos app's full-screen layout, measured from an iPhone screen recording and
+    /// scaled to a 1080 x 2340 frame. Photo and strip only: none of the buttons or text.
+    enum Gallery {
+        static let canvas = CGSize(width: 1080, height: 2340)
+        /// The photo fills the width, centred on the same line as in Photos (top-left origin).
+        static let photoArea = CGRect(x: 0, y: 1174 - 720, width: 1080, height: 1440)
+        static let stripCentreFromTop: CGFloat = 2053
+        static let thumbSize = CGSize(width: 54, height: 80)
+        static let currentWidth: CGFloat = 80      // the current photo is shown wider
+        static let gap: CGFloat = 8
+        static let currentGap: CGFloat = 35        // extra space either side of the current photo
+        static let cornerRadius: CGFloat = 7
+        static let slideDuration = 0.3             // seconds for the strip to move to the next photo
+    }
+
+    /// The Live Photo's still, small and upright, for the gallery strip.
+    static func thumbnail(for asset: PHAsset) async -> CGImage? {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        let image: UIImage? = await withCheckedContinuation { cont in
+            var resumed = false
+            PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 240, height: 240),
+                                                  contentMode: .aspectFill, options: options) { image, info in
+                if (info?[PHImageResultIsDegradedKey] as? Bool) == true { return }
+                guard !resumed else { return }
+                resumed = true
+                cont.resume(returning: image)
+            }
+        }
+        guard let image else { return nil }
+        // Redraw so the picture is upright whatever orientation it was stored in.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }.cgImage
+    }
+
+    /// Where each thumbnail sits (centre x, width) when photo number current is selected.
+    static func stripLayout(count: Int, current: Int) -> [(x: CGFloat, width: CGFloat)] {
+        let middle = Gallery.canvas.width / 2
+        let pitch = Gallery.thumbSize.width + Gallery.gap
+        return (0..<count).map { j in
+            if j == current { return (middle, Gallery.currentWidth) }
+            let offset = Gallery.currentWidth / 2 + Gallery.currentGap
+                + CGFloat(abs(j - current) - 1) * pitch + Gallery.thumbSize.width / 2
+            return (j > current ? middle + offset : middle - offset, Gallery.thumbSize.width)
+        }
+    }
+
+    /// The thumbnail strip, sliding to each photo as the video reaches it.
+    /// These layers use a bottom-left origin, as the video export requires.
+    static func galleryStrip(thumbnails: [CGImage?], switchTimes: [Double], duration: Double) -> CALayer {
+        let canvas = Gallery.canvas
+        let stripHeight: CGFloat = 120
+        let container = CALayer()
+        container.frame = CGRect(x: 0, y: canvas.height - Gallery.stripCentreFromTop - stripHeight / 2,
+                                 width: canvas.width, height: stripHeight)
+        // Fade the strip out at both edges, as Photos does.
+        let fade = CAGradientLayer()
+        fade.frame = container.bounds
+        fade.startPoint = CGPoint(x: 0, y: 0.5)
+        fade.endPoint = CGPoint(x: 1, y: 0.5)
+        fade.colors = [UIColor.clear.cgColor, UIColor.black.cgColor,
+                       UIColor.black.cgColor, UIColor.clear.cgColor]
+        fade.locations = [0.05, 0.1, 0.9, 0.95]
+        container.mask = fade
+
+        let count = thumbnails.count
+        guard count > 0, duration > 0 else { return container }
+        let layouts = (0..<count).map { stripLayout(count: count, current: $0) }
+
+        // Keyframes: hold on each photo, then slide to the next one around its switch time.
+        let linear = CAMediaTimingFunction(name: .linear)
+        let ease = CAMediaTimingFunction(name: .easeInEaseOut)
+        var times: [Double] = [0]
+        var states: [Int] = [0]
+        var easing: [CAMediaTimingFunction] = []
+        for k in 1..<max(count, 1) {
+            let switchTime = switchTimes[k]
+            let before = switchTime - switchTimes[k - 1]
+            let after = (k + 1 < count ? switchTimes[k + 1] : duration) - switchTime
+            let slide = max(0.001, min(Gallery.slideDuration, before * 0.8, after * 0.8))
+            times += [switchTime - slide / 2, switchTime + slide / 2]
+            states += [k - 1, k]
+            easing += [linear, ease]
+        }
+        times.append(duration)
+        states.append(count - 1)
+        easing.append(linear)
+        let keyTimes = times.map { NSNumber(value: min(max($0 / duration, 0), 1)) }
+
+        for j in 0..<count {
+            let thumb = CALayer()
+            let start = layouts[0][j]
+            thumb.bounds = CGRect(x: 0, y: 0, width: start.width, height: Gallery.thumbSize.height)
+            thumb.position = CGPoint(x: start.x, y: stripHeight / 2)
+            thumb.contents = thumbnails[j]
+            thumb.contentsGravity = .resizeAspectFill
+            thumb.masksToBounds = true
+            thumb.cornerRadius = Gallery.cornerRadius
+            thumb.backgroundColor = UIColor(white: 0.15, alpha: 1).cgColor
+            if count > 1 {
+                let slideX = CAKeyframeAnimation(keyPath: "position.x")
+                slideX.values = states.map { layouts[$0][j].x }
+                let resize = CAKeyframeAnimation(keyPath: "bounds.size.width")
+                resize.values = states.map { layouts[$0][j].width }
+                for animation in [slideX, resize] {
+                    animation.keyTimes = keyTimes
+                    animation.timingFunctions = easing
+                    animation.calculationMode = .linear
+                    animation.beginTime = AVCoreAnimationBeginTimeAtZero
+                    animation.duration = duration
+                    animation.isRemovedOnCompletion = false
+                    animation.fillMode = .both
+                    thumb.add(animation, forKey: animation.keyPath)
+                }
+            }
+            container.addSublayer(thumb)
+        }
+        return container
+    }
+
+    static func stitch(_ clips: [Clip], trimOverlaps: Bool, gallery: Bool = false) async throws -> URL {
         struct Loaded {
             let asset: AVURLAsset       // must stay alive while its tracks are used
             let video: AVAssetTrack
             let audio: AVAssetTrack?
             let range: CMTimeRange      // the clip's real video range
             let absoluteStart: Double   // real-world time (seconds) of the clip's first frame
+            let thumbnail: CGImage?
             var duration: Double { range.duration.seconds }
             var absoluteEnd: Double { absoluteStart + duration }
         }
@@ -316,7 +456,7 @@ enum ClipStitcher {
                 }
                 let start = clip.date.timeIntervalSince1970 - photoOffset
                 loaded.append(Loaded(asset: asset, video: video, audio: audio,
-                                     range: range, absoluteStart: start))
+                                     range: range, absoluteStart: start, thumbnail: clip.thumbnail))
             } catch {
                 continue // skip a clip that can't be read
             }
@@ -342,6 +482,7 @@ enum ClipStitcher {
             let naturalSize: CGSize
             let timeRange: CMTimeRange   // where it sits in the final video
             let fadeIn: CMTime           // how much of its start overlaps the previous clip
+            let thumbnail: CGImage?
         }
         let fadeLength = 0.1             // seconds: about 3 frames
         let timescale: CMTimeScale = 600
@@ -396,7 +537,7 @@ enum ClipStitcher {
             previous = clip
             placed.append(Placed(track: track, transform: transform, naturalSize: naturalSize,
                                  timeRange: CMTimeRange(start: insertAt, duration: source.duration),
-                                 fadeIn: fadeIn))
+                                 fadeIn: fadeIn, thumbnail: clip.thumbnail))
 
             // Sound follows the cuts directly (no overlap), so it never doubles up.
             if let audio = clip.audio, let audioOut {
@@ -416,13 +557,19 @@ enum ClipStitcher {
         if let audioOut, audioOut.segments.isEmpty { composition.removeTrack(audioOut) }
         if trackB.segments.isEmpty { composition.removeTrack(trackB) }
 
-        // The output frame: the first clip's size, turned upright.
+        // The output frame: the first clip's size, turned upright, or in gallery mode
+        // a phone-shaped frame with the photo where Photos shows it.
         let upright = CGRect(origin: .zero, size: placed[0].naturalSize).applying(placed[0].transform)
-        let renderSize = CGSize(width: (abs(upright.width) / 2).rounded() * 2,
-                                height: (abs(upright.height) / 2).rounded() * 2)
+        let renderSize = gallery ? Gallery.canvas
+            : CGSize(width: (abs(upright.width) / 2).rounded() * 2,
+                     height: (abs(upright.height) / 2).rounded() * 2)
         // Each clip's own rotation data can leave it offset, so place every clip
-        // explicitly: turned upright, scaled to fill the frame, and centred.
-        let fittedTransforms = placed.map { fit($0.transform, naturalSize: $0.naturalSize, into: renderSize) }
+        // explicitly: turned upright, scaled to fill the frame (or, in gallery mode,
+        // to fit the photo area), and centred.
+        let fittedTransforms = placed.map {
+            gallery ? fit($0.transform, naturalSize: $0.naturalSize, into: Gallery.photoArea, fill: false)
+                    : fit($0.transform, naturalSize: $0.naturalSize, into: renderSize)
+        }
 
         // Describe what's on screen at every moment: one clip on its own, or
         // two clips during a dissolve (the outgoing one fading out on top).
@@ -460,6 +607,24 @@ enum ClipStitcher {
         // recorded and the Live Photos keep their natural, uneven pacing.
         videoComposition.frameDuration = CMTime(value: 1, timescale: 60)
         videoComposition.renderSize = renderSize
+
+        if gallery {
+            // Each photo becomes the current one halfway through the dissolve into it.
+            let switchTimes: [Double] = placed.enumerated().map { i, p in
+                i == 0 ? 0 : p.timeRange.start.seconds + p.fadeIn.seconds / 2
+            }
+            let parent = CALayer()
+            parent.frame = CGRect(origin: .zero, size: renderSize)
+            parent.backgroundColor = UIColor.black.cgColor
+            let videoLayer = CALayer()
+            videoLayer.frame = parent.frame
+            parent.addSublayer(videoLayer)
+            parent.addSublayer(galleryStrip(thumbnails: placed.map(\.thumbnail),
+                                            switchTimes: switchTimes,
+                                            duration: composition.duration.seconds))
+            videoComposition.animationTool = AVVideoCompositionCoreAnimationTool(
+                postProcessingAsVideoLayer: videoLayer, in: parent)
+        }
 
         // Try best quality first, then a fixed-size export if that preset won't work.
         var lastError: Error = BuildError.exportFailed
