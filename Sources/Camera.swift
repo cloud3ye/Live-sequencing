@@ -118,8 +118,7 @@ final class CameraModel: ObservableObject {
         session.outputs.forEach { session.removeOutput($0) }
         session.sessionPreset = .photo
 
-        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-            ?? AVCaptureDevice.default(for: .video)
+        let device = Self.bestBackCamera()
         guard let device else {
             setProblem("No camera found on this device.")
             session.commitConfiguration()
@@ -140,6 +139,7 @@ final class CameraModel: ObservableObject {
         }
         session.addInput(input)
         videoDevice = device
+        setUpZoom(for: device)
 
         // After a tap, the Camera app goes back to automatic when the scene changes.
         subjectAreaObserver = NotificationCenter.default.addObserver(
@@ -227,6 +227,64 @@ final class CameraModel: ObservableObject {
                                                   options: [.new]) { [weak layer] c, _ in
             let angle = c.videoRotationAngleForHorizonLevelPreview
             DispatchQueue.main.async { layer?.connection?.videoRotationAngle = angle }
+        }
+    }
+
+    // MARK: Zoom (like the Camera app)
+
+    /// Zoom in the Camera app's numbers: 1 = main camera, 0.5 = ultra wide, 3 or 5 = telephoto.
+    @Published var zoom: CGFloat = 1
+    /// The lens buttons to show, e.g. [0.5, 1, 2, 3].
+    @Published var zoomPresets: [CGFloat] = [1]
+    @Published var zoomRange: ClosedRange<CGFloat> = 1...1
+    /// Camera-app zoom = the camera's own zoom factor x this.
+    private var zoomMultiplier: CGFloat = 1
+
+    /// The Camera app's back camera: one that switches between ultra wide, wide and
+    /// telephoto as you zoom, on phones that have them.
+    static func bestBackCamera() -> AVCaptureDevice? {
+        let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera,
+                                                    .builtInDualCamera, .builtInWideAngleCamera]
+        for type in types {
+            if let device = AVCaptureDevice.default(type, for: .video, position: .back) { return device }
+        }
+        return AVCaptureDevice.default(for: .video)
+    }
+
+    private func setUpZoom(for device: AVCaptureDevice) {
+        // Zoom factors where the next lens takes over (e.g. 2 = main camera, 6 = 3x telephoto).
+        let switchOvers = device.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat(truncating: $0) }
+        let hasUltraWide = device.constituentDevices.contains { $0.deviceType == .builtInUltraWideCamera }
+        let multiplier: CGFloat = hasUltraWide ? 1 / (switchOvers.first ?? 2) : 1
+        zoomMultiplier = multiplier
+        let minZoom = device.minAvailableVideoZoomFactor * multiplier
+        var presets: [CGFloat] = [1]
+        if minZoom < 0.9 { presets.append((minZoom * 10).rounded() / 10) }
+        presets += switchOvers.map { ($0 * multiplier * 10).rounded() / 10 }.filter { $0 > 1.1 }
+        let longestLens = presets.max() ?? 1
+        let maxZoom = min(device.maxAvailableVideoZoomFactor * multiplier, max(10, longestLens * 5))
+        if maxZoom >= 2, !presets.contains(where: { abs($0 - 2) < 0.3 }) { presets.append(2) }
+        zoomPresets = Array(Set(presets)).filter { $0 >= minZoom - 0.01 && $0 <= maxZoom }.sorted()
+        zoomRange = minZoom...max(minZoom, maxZoom)
+        setZoom(1)
+    }
+
+    /// Sets the zoom in Camera-app numbers. animated: a quick glide, as when tapping a lens button.
+    func setZoom(_ value: CGFloat, animated: Bool = false) {
+        let clamped = min(max(value, zoomRange.lowerBound), zoomRange.upperBound)
+        zoom = clamped
+        guard let device = videoDevice else { return }
+        let factor = clamped / zoomMultiplier
+        sessionQueue.async {
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+            let target = min(max(factor, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+            if animated {
+                device.ramp(toVideoZoomFactor: target, withRate: 10)
+            } else {
+                if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
+                device.videoZoomFactor = target
+            }
         }
     }
 
