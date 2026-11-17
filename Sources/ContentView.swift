@@ -18,6 +18,7 @@ struct ContentView: View {
 struct CaptureView: View {
     @StateObject private var camera = CameraModel()
     @StateObject private var builder = VideoBuilder()
+    @AppStorage("galleryMode") private var galleryMode = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -78,12 +79,21 @@ struct CaptureView: View {
 
                     Spacer()
 
-                    Button("Make video") {
-                        Task { await builder.build(localIdentifiers: camera.savedThisSequence) }
+                    VStack(alignment: .trailing, spacing: 8) {
+                        Button("Make video") {
+                            Task {
+                                await builder.build(localIdentifiers: camera.savedThisSequence,
+                                                    gallery: galleryMode)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(camera.isRunningSequence || camera.inFlight > 0
+                                  || camera.savedThisSequence.count < 2 || builder.isBuilding)
+                        Toggle(isOn: $galleryMode) {
+                            Text("Gallery").font(.caption)
+                        }
+                        .fixedSize()
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(camera.isRunningSequence || camera.inFlight > 0
-                              || camera.savedThisSequence.count < 2 || builder.isBuilding)
                     .frame(width: 150, alignment: .trailing)
                 }
                 .padding()
@@ -131,6 +141,7 @@ struct CameraPreview: UIViewRepresentable {
 struct SequencesView: View {
     @StateObject private var library = SequenceLibrary()
     @StateObject private var builder = VideoBuilder()
+    @AppStorage("galleryMode") private var galleryMode = false
 
     var body: some View {
         NavigationStack {
@@ -139,6 +150,10 @@ struct SequencesView: View {
                     Stepper("Max gap between photos: \(library.maxGap, specifier: "%.1f")s",
                             value: $library.maxGap, in: 1...10, step: 0.5)
                     Toggle("Trim overlapping footage", isOn: $builder.trimOverlaps)
+                    Toggle(isOn: $galleryMode) {
+                        Text("Gallery mode")
+                        Text("Frames the video like the Photos app, with the photo strip sliding along the bottom.")
+                    }
                 }
                 if let message = builder.message {
                     Section { Text(message) }
@@ -157,7 +172,7 @@ struct SequencesView: View {
                             }
                             Spacer()
                             Button("Make video") {
-                                Task { await builder.build(from: sequence.assets) }
+                                Task { await builder.build(from: sequence.assets, gallery: galleryMode) }
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(builder.isBuilding)
