@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Photos
+import CoreMotion
 
 struct ContentView: View {
     var body: some View {
@@ -20,7 +21,11 @@ struct CaptureView: View {
     @StateObject private var builder = VideoBuilder()
     @AppStorage("galleryMode") private var galleryMode = false
     @State private var showGapSettings = false
-    @AppStorage("showGrid") private var showGrid = false
+    @StateObject private var level = LevelModel()
+    @State private var isZoomDialShown = false
+    @State private var zoomActivity = 0       // bumps on each zoom touch, to restart the hide timer
+    @State private var zoomDragStart: CGFloat?
+    @State private var pinchStartZoom: CGFloat = 1
     @State private var focusPoint: CGPoint?   // where the yellow square is, in screen points
     @State private var focusActivity = 0      // bumps on each touch, to restart the hide timer
 
@@ -43,12 +48,20 @@ struct CaptureView: View {
                     guard focusPoint != nil else { return }
                     camera.setExposureBias(camera.exposureBias - Float(distance / 150))
                     focusActivity += 1
+                },
+                onPinch: { state, scale in
+                    if state == .began { pinchStartZoom = camera.zoom }
+                    camera.setZoom(pinchStartZoom * scale)
+                    showZoomDial()
                 }
             )
             .ignoresSafeArea()
             .overlay {
                 ZStack {
-                    if showGrid { GridLines() }
+                    GridLines()
+                    if let deviation = level.deviation {
+                        LevelIndicator(deviation: deviation)
+                    }
                     if let focusPoint {
                         FocusSquare(locked: camera.isAEAFLocked, bias: camera.exposureBias)
                             .position(focusPoint)
@@ -101,6 +114,8 @@ struct CaptureView: View {
                     .padding(14)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 }
+
+                zoomControl
 
                 HStack(alignment: .center) {
                     Button {
@@ -171,11 +186,23 @@ struct CaptureView: View {
             }
         }
         .onChange(of: camera.focusResets) { focusPoint = nil }
+        // The zoom dial goes back to the lens buttons shortly after you let go.
+        .task(id: zoomActivity) {
+            guard zoomActivity > 0 else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            if !Task.isCancelled, zoomDragStart == nil {
+                withAnimation(.easeOut(duration: 0.25)) { isZoomDialShown = false }
+            }
+        }
         // Coming back from Settings (or the background) retries the camera.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             Task { await camera.start() }
         }
-        .onDisappear { camera.stopSequence() }
+        .onAppear { level.start() }
+        .onDisappear {
+            camera.stopSequence()
+            level.stop()
+        }
     }
 
     private func showFocusSquare(at point: CGPoint) {
@@ -183,17 +210,10 @@ struct CaptureView: View {
         focusActivity += 1
     }
 
-    /// Grid switch, AE/AF LOCK label and exposure readout, along the top like the Camera app.
+    /// AE/AF LOCK label and exposure readout, along the top like the Camera app.
     private var topBar: some View {
         HStack {
-            Button { showGrid.toggle() } label: {
-                Image(systemName: "grid")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(showGrid ? Color.yellow : Color.white)
-                    .frame(width: 38, height: 38)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-            .accessibilityLabel(showGrid ? "Hide grid" : "Show grid")
+            Color.clear.frame(width: 38, height: 38)   // balances the exposure readout
 
             Spacer()
 
@@ -229,6 +249,59 @@ struct CaptureView: View {
         .padding(.top, 6)
     }
 
+    /// Lens buttons (.5, 1, 2, 3...) like the Camera app. Tap one to jump to it; drag
+    /// sideways on them, or pinch the preview, for the zoom dial.
+    private var zoomControl: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.zoomPresets, id: \.self) { preset in
+                let active = preset == activeZoomPreset
+                Button { camera.setZoom(preset, animated: true) } label: {
+                    Text(active ? zoomLabel(camera.zoom) + "×" : zoomLabel(preset, short: true))
+                        .font(.system(size: active ? 13 : 11, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(active ? Color.yellow : Color.white)
+                        .frame(width: active ? 40 : 32, height: active ? 40 : 32)
+                        .background(Circle().fill(Color.black.opacity(0.45)))
+                }
+            }
+        }
+        .padding(4)
+        .background(.ultraThinMaterial, in: Capsule())
+        .opacity(isZoomDialShown ? 0.001 : 1)
+        .overlay(alignment: .bottom) {
+            if isZoomDialShown {
+                ZoomDial(zoom: camera.zoom, range: camera.zoomRange, presets: camera.zoomPresets)
+                    .frame(width: 360, height: 110)
+                    .transition(.opacity)
+            }
+        }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 6)
+                .onChanged { drag in
+                    let start = zoomDragStart ?? camera.zoom
+                    if zoomDragStart == nil { zoomDragStart = start }
+                    // Drag left to zoom in, as on the Camera app's dial.
+                    camera.setZoom(start * exp(-drag.translation.width / 140))
+                    showZoomDial()
+                }
+                .onEnded { _ in
+                    zoomDragStart = nil
+                    zoomActivity += 1
+                }
+        )
+    }
+
+    private var activeZoomPreset: CGFloat {
+        camera.zoomPresets.last(where: { $0 <= camera.zoom + 0.05 }) ?? camera.zoomPresets.first ?? 1
+    }
+
+    private func showZoomDial() {
+        if !isZoomDialShown {
+            withAnimation(.easeOut(duration: 0.15)) { isZoomDialShown = true }
+        }
+        zoomActivity += 1
+    }
+
     private func gapSlider(_ label: String, value: Binding<Double>) -> some View {
         HStack {
             Text(label)
@@ -256,6 +329,8 @@ struct CameraPreview: UIViewRepresentable {
     var onLongPress: @MainActor (CGPoint, CGPoint) -> Void = { _, _ in }
     /// Vertical movement since the last call, in points (negative is up).
     var onVerticalDrag: @MainActor (CGFloat) -> Void = { _ in }
+    /// Pinch state and scale since the pinch began.
+    var onPinch: @MainActor (UIGestureRecognizer.State, CGFloat) -> Void = { _, _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -277,6 +352,8 @@ struct CameraPreview: UIViewRepresentable {
         view.addGestureRecognizer(longPress)
         view.addGestureRecognizer(tap)
         view.addGestureRecognizer(pan)
+        let pinch = UIPinchGestureRecognizer(target: coordinator, action: #selector(Coordinator.pinched(_:)))
+        view.addGestureRecognizer(pinch)
         return view
     }
 
@@ -310,6 +387,10 @@ struct CameraPreview: UIViewRepresentable {
             gesture.setTranslation(.zero, in: gesture.view)
             parent.onVerticalDrag(move.y)
         }
+
+        @objc func pinched(_ gesture: UIPinchGestureRecognizer) {
+            parent.onPinch(gesture.state, gesture.scale)
+        }
     }
 
     final class PreviewView: UIView {
@@ -340,6 +421,135 @@ struct GridLines: View {
             }
             .stroke(Color.white.opacity(0.5), lineWidth: 0.6)
         }
+    }
+}
+
+/// Zoom as the Camera app writes it: "1", "2", "0.5", "1.4" (or ".5" on a lens button).
+func zoomLabel(_ value: CGFloat, short: Bool = false) -> String {
+    let rounded = (value * 10).rounded() / 10
+    if rounded == rounded.rounded() { return String(format: "%.0f", rounded) }
+    let text = String(format: "%.1f", rounded)
+    return short && rounded < 1 ? String(text.dropFirst()) : text
+}
+
+/// The Camera app's zoom dial: an arc of ticks that turns as you zoom, with the
+/// lens positions marked and the current zoom above.
+struct ZoomDial: View {
+    let zoom: CGFloat
+    let range: ClosedRange<CGFloat>
+    let presets: [CGFloat]
+
+    var body: some View {
+        Canvas { context, size in
+            let radius = size.width * 1.1
+            let top: CGFloat = 40
+            let centre = CGPoint(x: size.width / 2, y: top + radius)
+            let spread: CGFloat = 0.5              // how far the dial turns per step in zoom
+            let maxAngle: CGFloat = 0.6
+            func angle(_ value: CGFloat) -> CGFloat { (log(value) - log(zoom)) * spread }
+            func point(_ a: CGFloat, _ r: CGFloat) -> CGPoint {
+                CGPoint(x: centre.x + r * sin(a), y: centre.y - r * cos(a))
+            }
+
+            // Dark band behind the ticks.
+            var band = Path()
+            band.addArc(center: centre, radius: radius + 8, startAngle: .radians(-.pi / 2 - maxAngle),
+                        endAngle: .radians(-.pi / 2 + maxAngle), clockwise: false)
+            band.addArc(center: centre, radius: radius - 34, startAngle: .radians(-.pi / 2 + maxAngle),
+                        endAngle: .radians(-.pi / 2 - maxAngle), clockwise: true)
+            band.closeSubpath()
+            context.fill(band, with: .color(.black.opacity(0.5)))
+
+            // Ticks: fine steps below 2x, coarser above; the lens positions are labelled.
+            var value = (range.lowerBound * 10).rounded(.up) / 10
+            while value <= range.upperBound + 0.001 {
+                let a = angle(value)
+                if abs(a) < maxAngle {
+                    let isPreset = presets.contains { abs($0 - value) < 0.05 }
+                    let whole = abs(value - value.rounded()) < 0.05
+                    let length: CGFloat = isPreset ? 12 : (whole ? 8 : 5)
+                    var tick = Path()
+                    tick.move(to: point(a, radius - 6))
+                    tick.addLine(to: point(a, radius - 6 - length))
+                    context.stroke(tick, with: .color(.white.opacity(isPreset ? 1 : 0.6)),
+                                   lineWidth: isPreset ? 1.5 : 1)
+                    if isPreset {
+                        context.draw(Text(zoomLabel(value)).font(.caption2.weight(.semibold))
+                                        .foregroundColor(.white),
+                                     at: point(a, radius - 28))
+                    }
+                }
+                value += value < 2 ? 0.1 : (value < 10 ? 0.5 : 1)
+                value = (value * 10).rounded() / 10
+            }
+
+            // Centre marker and the current zoom.
+            var marker = Path()
+            marker.move(to: point(0, radius + 6))
+            marker.addLine(to: point(0, radius - 22))
+            context.stroke(marker, with: .color(.yellow), lineWidth: 2)
+            context.draw(Text(zoomLabel(zoom) + "×").font(.footnote.weight(.bold)).foregroundColor(.yellow),
+                         at: CGPoint(x: size.width / 2, y: 16))
+        }
+        .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.18),
+                                     .init(color: .black, location: 0.82), .init(color: .clear, location: 1)],
+                             startPoint: .leading, endPoint: .trailing))
+    }
+}
+
+/// The Camera app's level: a line that turns with the horizon and goes solid yellow when straight.
+struct LevelIndicator: View {
+    let deviation: Double   // radians away from level
+
+    var body: some View {
+        let isLevel = abs(deviation) < Double.pi / 180
+        ZStack {
+            HStack(spacing: 96) {
+                Rectangle().frame(width: 34, height: 1.5)
+                Rectangle().frame(width: 34, height: 1.5)
+            }
+            Rectangle()
+                .frame(width: isLevel ? 96 : 84, height: 1.5)
+                .rotationEffect(.radians(isLevel ? 0 : -deviation))
+        }
+        .foregroundStyle(isLevel ? Color.yellow : Color.white)
+        .shadow(color: .black.opacity(0.4), radius: 1)
+        .animation(.easeOut(duration: 0.15), value: isLevel)
+    }
+}
+
+/// Reads the phone's tilt for the level, like the Camera app's Level setting.
+@MainActor
+final class LevelModel: ObservableObject {
+    /// How far from level, in radians; nil when tilted a lot or held flat.
+    @Published var deviation: Double?
+    private let motion = CMMotionManager()
+
+    func start() {
+        guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
+        motion.deviceMotionUpdateInterval = 1.0 / 30
+        motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
+            guard let gravity = data?.gravity else { return }
+            Task { @MainActor in self?.update(gravity) }
+        }
+    }
+
+    func stop() { motion.stopDeviceMotionUpdates() }
+
+    private func update(_ g: CMAcceleration) {
+        // Pointing straight up or down: no horizon to level against.
+        guard abs(g.z) < 0.8 else {
+            if deviation != nil { deviation = nil }
+            return
+        }
+        let angle = atan2(g.x, -g.y)
+        let nearest = (angle / (.pi / 2)).rounded() * (.pi / 2)
+        let offset = angle - nearest
+        // Like the Camera app, only show it when the phone is close to level.
+        let newValue: Double? = abs(offset) < 10 * .pi / 180 ? offset : nil
+        if let old = deviation, let new = newValue, abs(old - new) < 0.002 { return }
+        if deviation == nil && newValue == nil { return }
+        deviation = newValue
     }
 }
 
