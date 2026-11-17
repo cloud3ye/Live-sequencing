@@ -44,6 +44,15 @@ final class CameraModel: ObservableObject {
     /// True when the fix is a permission switch in Settings.
     @Published var needsSettings = false
     private var runtimeErrorObserver: NSObjectProtocol?
+    private var subjectAreaObserver: NSObjectProtocol?
+
+    /// Exposure compensation in EV, like the Camera app's sun slider.
+    @Published var exposureBias: Float = 0
+    /// AE/AF lock, set by a long press, as in the Camera app.
+    @Published var isAEAFLocked = false
+    /// Goes up each time focus and exposure return to automatic for the whole scene.
+    @Published var focusResets = 0
+    static let biasLimits: ClosedRange<Float> = -2...2
 
     // MARK: Setup
 
@@ -132,6 +141,16 @@ final class CameraModel: ObservableObject {
         session.addInput(input)
         videoDevice = device
 
+        // After a tap, the Camera app goes back to automatic when the scene changes.
+        subjectAreaObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: device, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.isAEAFLocked else { return }
+                self.resetFocusAndExposure()
+            }
+        }
+
         // Microphone gives the Live Photos their sound, same as the Camera app.
         if let mic = AVCaptureDevice.default(for: .audio),
            let micInput = try? AVCaptureDeviceInput(device: mic),
@@ -208,6 +227,59 @@ final class CameraModel: ObservableObject {
                                                   options: [.new]) { [weak layer] c, _ in
             let angle = c.videoRotationAngleForHorizonLevelPreview
             DispatchQueue.main.async { layer?.connection?.videoRotationAngle = angle }
+        }
+    }
+
+    // MARK: Focus and exposure (like the Camera app)
+
+    /// Tap: focus and expose on a point, then keep adjusting.
+    /// Long press: focus and expose there once, then hold (AE/AF lock).
+    /// The point is in camera coordinates, 0...1 on each axis.
+    func focusAndExpose(at point: CGPoint, lock: Bool) {
+        isAEAFLocked = lock
+        applyFocusAndExposure(at: point, lock: lock, followScene: !lock)
+    }
+
+    /// Back to the default: focus and exposure follow the whole scene.
+    func resetFocusAndExposure() {
+        isAEAFLocked = false
+        setExposureBias(0)
+        applyFocusAndExposure(at: CGPoint(x: 0.5, y: 0.5), lock: false, followScene: false)
+        focusResets += 1
+    }
+
+    private func applyFocusAndExposure(at point: CGPoint, lock: Bool, followScene: Bool) {
+        guard let device = videoDevice else { return }
+        let point = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
+        sessionQueue.async {
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+            // "Auto" modes adjust once and then hold; "continuous" modes keep adjusting.
+            let focusMode: AVCaptureDevice.FocusMode = lock ? .autoFocus : .continuousAutoFocus
+            if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(focusMode) {
+                device.focusPointOfInterest = point
+                device.focusMode = focusMode
+            }
+            let exposureMode: AVCaptureDevice.ExposureMode = lock ? .autoExpose : .continuousAutoExposure
+            if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(exposureMode) {
+                device.exposurePointOfInterest = point
+                device.exposureMode = exposureMode
+            }
+            device.isSubjectAreaChangeMonitoringEnabled = followScene
+        }
+    }
+
+    /// Brighter or darker, in EV (clamped to -2...+2, like the Camera app).
+    func setExposureBias(_ value: Float) {
+        var clamped = min(max(value, Self.biasLimits.lowerBound), Self.biasLimits.upperBound)
+        if abs(clamped) < 0.05 { clamped = 0 }   // snap back to exactly zero
+        exposureBias = clamped
+        guard let device = videoDevice else { return }
+        sessionQueue.async {
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+            let bias = min(max(clamped, device.minExposureTargetBias), device.maxExposureTargetBias)
+            device.setExposureTargetBias(bias, completionHandler: nil)
         }
     }
 
