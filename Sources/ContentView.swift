@@ -19,6 +19,7 @@ struct CaptureView: View {
     @StateObject private var camera = CameraModel()
     @StateObject private var builder = VideoBuilder()
     @AppStorage("galleryMode") private var galleryMode = false
+    @State private var showGapSettings = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -50,18 +51,40 @@ struct CaptureView: View {
                 if builder.isBuilding { pill("Building video…") }
                 if let message = builder.message { pill(message) }
 
-                HStack(alignment: .center) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Random gap")
+                if showGapSettings {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Random gap between shots")
+                            .font(.callout.weight(.semibold))
+                        gapSlider("Shortest", value: $camera.minGap)
+                        gapSlider("Longest", value: $camera.maxGap)
+                        Text("Clips last about 3 s, so gaps longer than that leave jumps between them: choppier.")
                             .font(.caption)
-                        Text("\(camera.gapRange.lowerBound, specifier: "%.1f")–\(camera.gapRange.upperBound, specifier: "%.1f")s")
-                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
-                        if camera.isRunningSequence, let gap = camera.lastGap {
-                            Text("Next in \(gap, specifier: "%.1f")s")
+                    }
+                    .padding(14)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+
+                HStack(alignment: .center) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showGapSettings.toggle() }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Text("Random gap")
+                                Image(systemName: showGapSettings ? "chevron.down" : "slider.horizontal.3")
+                            }
+                            .font(.caption)
+                            Text("\(camera.gapRange.lowerBound, specifier: "%.1f")–\(camera.gapRange.upperBound, specifier: "%.1f")s")
                                 .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            if camera.isRunningSequence, let gap = camera.lastGap {
+                                Text("Next in \(gap, specifier: "%.1f")s")
+                                    .font(.caption.monospacedDigit())
+                            }
                         }
                     }
+                    .buttonStyle(.plain)
                     .frame(width: 150, alignment: .leading)
 
                     Spacer()
@@ -107,6 +130,18 @@ struct CaptureView: View {
             Task { await camera.start() }
         }
         .onDisappear { camera.stopSequence() }
+    }
+
+    private func gapSlider(_ label: String, value: Binding<Double>) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .frame(width: 60, alignment: .leading)
+            Slider(value: value, in: CameraModel.gapLimits, step: 0.1)
+            Text("\(value.wrappedValue, specifier: "%.1f")s")
+                .font(.caption.monospacedDigit())
+                .frame(width: 40, alignment: .trailing)
+        }
     }
 
     private func pill(_ text: String) -> some View {
