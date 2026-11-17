@@ -18,8 +18,23 @@ final class CameraModel: ObservableObject {
     private var configured = false
 
     @Published var isRunningSequence = false
-    /// Each gap between shutter presses is picked at random from this range.
-    let gapRange: ClosedRange<Double> = 0.8...2.2
+    /// Each gap between shutter presses is picked at random between these two.
+    /// Set on the Capture screen and remembered between launches.
+    @Published var minGap: Double = UserDefaults.standard.object(forKey: "minGap") as? Double ?? 0.8 {
+        didSet {
+            if minGap > maxGap { maxGap = minGap }
+            UserDefaults.standard.set(minGap, forKey: "minGap")
+        }
+    }
+    @Published var maxGap: Double = UserDefaults.standard.object(forKey: "maxGap") as? Double ?? 2.2 {
+        didSet {
+            if maxGap < minGap { minGap = maxGap }
+            UserDefaults.standard.set(maxGap, forKey: "maxGap")
+        }
+    }
+    /// The limits the sliders allow, in seconds.
+    static let gapLimits: ClosedRange<Double> = 0.3...6.0
+    var gapRange: ClosedRange<Double> { min(minGap, maxGap)...max(minGap, maxGap) }
     @Published var lastGap: Double?
     @Published var savedThisSequence: [String] = [] // Photos local identifiers
     @Published var inFlight = 0
